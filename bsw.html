@@ -219,6 +219,12 @@ input:checked + .slider:before{transform:translateX(18px); background:var(--gold
       </div>
     </div>
 
+    <button class="step-btn" id="optimizeBtn" onclick="findOptimalSize()"
+      style="width:100%; padding:11px; margin-top:12px; background:var(--surface-2); border:1px solid var(--purple); color:var(--purple); font-weight:700;">
+      Cari Ukuran Optimal
+    </button>
+    <div id="optimizeResult" style="margin-top:8px;"></div>
+
     <div class="toggle-row">
       <div>
         <div class="toggle-title">Auto-scan tiap 12 detik</div>
@@ -379,29 +385,75 @@ async function quoteFromRouters(routerAddr, amountIn, path){
 
 function getGasEstimate(){ return parseFloat(document.getElementById('gasEstimate').value || "0.0008"); }
 
+async function computeRouteProfit(size){
+  const amountIn = ethers.utils.parseEther(size.toString());
+  const [pancakeOut, biswapOut] = await Promise.all([
+    quoteFromRouters(ROUTER_PANCAKE, amountIn, [WBNB_ADDR, BSW_ADDR]),
+    quoteFromRouters(ROUTER_BISWAP, amountIn, [WBNB_ADDR, BSW_ADDR])
+  ]);
+  const pancakePrice = parseFloat(ethers.utils.formatEther(pancakeOut[1])) / size;
+  const biswapPrice  = parseFloat(ethers.utils.formatEther(biswapOut[1])) / size;
+  const sellOnPancake = pancakePrice > biswapPrice;
+  const sellRouter = sellOnPancake ? ROUTER_PANCAKE : ROUTER_BISWAP;
+  const buyRouter  = sellOnPancake ? ROUTER_BISWAP  : ROUTER_PANCAKE;
+  const sellName = sellOnPancake ? "PancakeSwap" : "Biswap";
+  const buyName  = sellOnPancake ? "Biswap" : "PancakeSwap";
+  const sellOutAmounts = sellOnPancake ? pancakeOut : biswapOut;
+  const bswReceived = sellOutAmounts[1];
+  const buyBackOut = await quoteFromRouters(buyRouter, bswReceived, [BSW_ADDR, WBNB_ADDR]);
+  const wbnbFinal = buyBackOut[1];
+  const wbnbFinalNum = parseFloat(ethers.utils.formatEther(wbnbFinal));
+  const grossProfitWbnb = wbnbFinalNum - size;
+  const gasTotal = getGasEstimate() * 2;
+  const netProfitWbnb = grossProfitWbnb - gasTotal;
+  const netProfitPct = (netProfitWbnb / size) * 100;
+  return { size, sellRouter, buyRouter, sellName, buyName, amountIn, bswReceived, wbnbFinal, wbnbFinalNum, netProfitPct, pancakePrice, biswapPrice };
+}
+
+async function findOptimalSize(){
+  const btn = document.getElementById('optimizeBtn');
+  const resultEl = document.getElementById('optimizeResult');
+  btn.disabled = true;
+  btn.textContent = "Mencari...";
+  resultEl.innerHTML = "";
+  const candidates = [0.01, 0.02, 0.04, 0.06, 0.08, 0.12, 0.16, 0.2, 0.3];
+  const results = [];
+  for (const size of candidates){
+    try{
+      const r = await computeRouteProfit(size);
+      results.push(r);
+    }catch(e){ /* skip failed size */ }
+  }
+  results.sort((a,b) => b.netProfitPct - a.netProfitPct);
+  const best = results[0];
+  let html = `<div style="font-size:12px; color:var(--text-dim); margin-bottom:8px;">Hasil scan ${results.length} ukuran trade, diurutkan dari paling untung:</div>`;
+  results.slice(0,5).forEach((r, i) => {
+    const color = r.netProfitPct >= 0 ? "var(--profit)" : "var(--loss)";
+    html += `<div style="display:flex; justify-content:space-between; padding:6px 0; font-size:12px; ${i===0 ? 'font-weight:700;' : ''}">
+      <span class="mono">${r.size} WBNB</span>
+      <span class="mono" style="color:${color}">${r.netProfitPct >= 0 ? '+' : ''}${r.netProfitPct.toFixed(3)}%</span>
+    </div>`;
+  });
+  resultEl.innerHTML = html;
+  btn.disabled = false;
+  btn.textContent = "Cari Ukuran Optimal";
+  if (best){
+    document.getElementById('tradeSize').value = best.size;
+    addLog(`Ukuran optimal ditemukan: ${best.size} WBNB (${best.netProfitPct.toFixed(3)}%)`, "signal");
+    scanNow();
+  }
+}
+
 async function scanNow(){
   try{
     const size = parseFloat(document.getElementById('tradeSize').value || "0.02");
-    const amountIn = ethers.utils.parseEther(size.toString());
-
-    const [pancakeOut, biswapOut] = await Promise.all([
-      quoteFromRouters(ROUTER_PANCAKE, amountIn, [WBNB_ADDR, BSW_ADDR]),
-      quoteFromRouters(ROUTER_BISWAP, amountIn, [WBNB_ADDR, BSW_ADDR])
-    ]);
-
-    const pancakePrice = parseFloat(ethers.utils.formatEther(pancakeOut[1])) / size;
-    const biswapPrice  = parseFloat(ethers.utils.formatEther(biswapOut[1])) / size;
+    const r = await computeRouteProfit(size);
+    const { sellRouter, buyRouter, sellName, buyName, amountIn, bswReceived, wbnbFinal, wbnbFinalNum, netProfitPct, pancakePrice, biswapPrice } = r;
 
     document.getElementById('pricePancake').textContent = fmt(pancakePrice) + " BSW";
     document.getElementById('priceBiswap').textContent  = fmt(biswapPrice) + " BSW";
 
-    const sellOnPancake = pancakePrice > biswapPrice; // sell WBNB where price higher
-    const sellRouter = sellOnPancake ? ROUTER_PANCAKE : ROUTER_BISWAP;
-    const buyRouter  = sellOnPancake ? ROUTER_BISWAP  : ROUTER_PANCAKE;
-    const sellName = sellOnPancake ? "PancakeSwap" : "Biswap";
-    const buyName  = sellOnPancake ? "Biswap" : "PancakeSwap";
-    const sellOutAmounts = sellOnPancake ? pancakeOut : biswapOut;
-
+    const sellOnPancake = sellName === "PancakeSwap";
     document.getElementById('tilePancake').className = "price-tile " + (sellOnPancake ? "expensive" : "cheap");
     document.getElementById('tileBiswap').className  = "price-tile " + (sellOnPancake ? "cheap" : "expensive");
     document.getElementById('tagPancake').textContent = sellOnPancake ? "JUAL DI SINI" : "BELI DI SINI";
@@ -412,18 +464,7 @@ async function scanNow(){
     const spreadPct = (Math.abs(pancakePrice - biswapPrice) / Math.min(pancakePrice, biswapPrice)) * 100;
     document.getElementById('spreadPct').textContent = spreadPct.toFixed(3) + "%";
 
-    // simulate leg 2: sell BUSD received back into WBNB on the cheaper DEX
-    const bswReceived = sellOutAmounts[1];
-    const buyBackOut = await quoteFromRouters(buyRouter, bswReceived, [BSW_ADDR, WBNB_ADDR]);
-    const wbnbFinal = buyBackOut[1];
-
-    const wbnbFinalNum = parseFloat(ethers.utils.formatEther(wbnbFinal));
-    const grossProfitWbnb = wbnbFinalNum - size;
-    const gasTotal = getGasEstimate() * 2; // 2 separate transactions
-    // convert gas (BNB) to WBNB terms 1:1 since WBNB pegged to BNB
-    const netProfitWbnb = grossProfitWbnb - gasTotal;
-    const netProfitPct = (netProfitWbnb / size) * 100;
-
+    const gasTotal = getGasEstimate() * 2;
     lastQuote = { sellRouter, buyRouter, sellName, buyName, amountIn, bswReceived, wbnbFinal, netProfitPct, size };
 
     document.getElementById('routeLine').innerHTML =
